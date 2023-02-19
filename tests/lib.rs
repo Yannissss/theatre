@@ -11,7 +11,7 @@ fn sleep_ms(count: u64) {
 fn test_single_send() {
     let actor: Actor<&'static str> = Actor::graceful(Echo);
     actor.tell("Hello, World!").unwrap();
-    actor.kill();
+    actor.kill().unwrap();
     actor.wait();
 }
 
@@ -19,7 +19,7 @@ fn test_single_send() {
 fn test_graceful() {
     let actor: Actor<i32> = Actor::graceful(Echo);
     actor.tell(0).unwrap();
-    actor.kill();
+    actor.kill().unwrap();
     for k in 1..=10 {
         actor.tell(k).unwrap();
     }
@@ -31,7 +31,7 @@ fn test_disgraceful() {
     let actor: Actor<i32> = Actor::disgraceful(Echo);
     actor.tell(0).unwrap();
     sleep_ms(200);
-    actor.kill();
+    actor.kill().unwrap();
     for k in 1..=10 {
         actor.tell(k).unwrap();
     }
@@ -46,7 +46,7 @@ fn test_blanket_interpreters() {
     for k in 1..=10 {
         actor.tell(k).unwrap();
     }
-    actor.kill();
+    actor.kill().unwrap();
     actor.wait();
 }
 
@@ -61,9 +61,34 @@ fn test_death_wait() {
             cloned_actor.tell(4 * k - 3).unwrap();
             sleep_ms(150);
         }
-        cloned_actor.kill();
+        cloned_actor.kill().unwrap();
     });
 
     println!("Waiting for actor to die...");
     actor.wait();
+}
+
+#[test]
+fn test_instant_death_graceful() {
+    let actor: Actor<i32> = Actor::graceful(Echo);
+    let cloned = actor.clone();
+    thread::spawn(move || {
+        cloned.tell(0).unwrap();
+    });
+    actor.wait();
+}
+
+#[test]
+fn test_instant_death_disgraceful() {
+    // This should instanly return
+    let actor: Actor<i32> = Actor::disgraceful(Echo);
+    actor.wait();
+}
+
+#[test]
+#[should_panic]
+fn test_weak_cloning() {
+    let actor: Actor<i32> = Actor::graceful(Echo);
+    let cloned = actor.weak();
+    cloned.tell(0).unwrap();
 }

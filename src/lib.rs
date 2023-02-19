@@ -14,6 +14,10 @@ use thiserror::Error;
 pub enum ActingErr {
     #[error("Actor that was contacted is dead!")]
     DeadActor,
+    #[error("Tried to send a message with a weak clone!")]
+    SendWeakClone,
+    #[error("Tried to kill an actor with a weak clone!")]
+    KillWeakClone,
 }
 
 /// Trait that describe that a stateful interpreter
@@ -51,7 +55,7 @@ where
 /// that listens to incoming message and process
 /// them
 pub struct Actor<M> {
-    channel: Sender<Option<M>>,
+    channel: Option<Sender<Option<M>>>,
     should_die: Arc<AtomicBool>,
     till_death: Arc<Condvar>,
     is_dead: Arc<Mutex<bool>>,
@@ -98,20 +102,28 @@ where
     }
 
     /// Cleanup all pending messages
-    fn cleanup<I>(&self, interpreter: &mut I, consumer: &Receiver<Option<M>>)
+    fn cleanup_and_dies<I>(self, interpreter: &mut I, consumer: &Receiver<Option<M>>)
     where
         I: Interpreter<M>,
     {
+        let till_death = self.till_death.clone();
+        let is_dead = self.is_dead.clone();
+        drop(self);
+
         while let Ok(message) = consumer.try_recv() {
             match message {
                 None => (), // Do nothing since message was a kill signal
                 Some(message) => interpreter.interpret(message),
             }
         }
+
+        let mut guard = is_dead.lock().unwrap();
+        *guard = true;
+        till_death.notify_all();
     }
 
     /// Dies & notify all waiters
-    fn die(self) {
+    fn dies(self) {
         let till_death = self.till_death.clone();
         let is_dead = self.is_dead.clone();
         drop(self);
@@ -129,24 +141,22 @@ where
     {
         let (channel, consumer) = mpsc::channel();
         let actor = Self {
-            channel,
+            channel: Some(channel),
             should_die: Arc::new(AtomicBool::new(false)),
             till_death: Arc::new(Condvar::default()),
             is_dead: Arc::new(Mutex::new(false)),
         };
-        let cloned_actor = actor.clone();
+        let weak_actor = actor.weak();
 
         let mut interpreter = interpreter;
         thread::spawn(move || {
             // Main message handling loop
-            actor.loop_until_killed(&mut interpreter, &consumer);
-            // Cleaning up
-            actor.cleanup(&mut interpreter, &consumer);
-            // Dies & notify all waiters
-            actor.die();
+            weak_actor.loop_until_killed(&mut interpreter, &consumer);
+            // Cleaning up & notify all waiters
+            weak_actor.cleanup_and_dies(&mut interpreter, &consumer);
         });
 
-        cloned_actor
+        actor
     }
 
     /// Creates and returns and actor that disgracefully
@@ -157,24 +167,24 @@ where
     {
         let (channel, consumer) = mpsc::channel();
         let actor = Self {
-            channel,
+            channel: Some(channel),
             should_die: Arc::new(AtomicBool::new(false)),
             till_death: Arc::new(Condvar::default()),
             is_dead: Arc::new(Mutex::new(false)),
         };
-        let cloned_actor = actor.clone();
+        let weak_actor = actor.weak();
 
         let mut interpreter = interpreter;
         thread::spawn(move || {
             // Main message handling loop
-            actor.loop_until_killed(&mut interpreter, &consumer);
+            weak_actor.loop_until_killed(&mut interpreter, &consumer);
             // Cleaning up
             // No cleaning up since we are disgraceful
             // Dies & notify all waiters
-            actor.die();
+            weak_actor.dies();
         });
 
-        cloned_actor
+        actor
     }
 
     /// Creates and returns and actor that gracefully
@@ -201,21 +211,42 @@ where
 
     /// Send a message to an actor
     pub fn tell(&self, message: M) -> Result<(), ActingErr> {
-        self.channel
-            .send(Some(message))
-            .map_err(|_| ActingErr::DeadActor)
+        match &self.channel {
+            None => Err(ActingErr::SendWeakClone),
+            Some(channel) => channel
+                .send(Some(message))
+                .map_err(|_| ActingErr::DeadActor),
+        }
     }
 
     /// Kills an actor
     /// This function returns `Ok(())` if it succesfully kills it
     /// And error explaining the reason it could not do if not
     /// Trying to kill a dead actor does not do anything
-    pub fn kill(&self) {
-        self.should_die.store(true, Ordering::SeqCst);
-        // Signal the actor that he has to die
-        match self.channel.send(None) {
-            Err(_) => (), // Actor already dead so do nothing
-            Ok(_) => (),  // Sent a dummy message to process
+    pub fn kill(&self) -> Result<(), ActingErr> {
+        match &self.channel {
+            None => Err(ActingErr::KillWeakClone),
+            Some(channel) => {
+                self.should_die.store(true, Ordering::SeqCst);
+                // Signal the actor that he has to die
+                match channel.send(None) {
+                    Err(_) => (), // Actor already dead so do nothing
+                    Ok(_) => (),  // Sent a dummy message to process
+                };
+                Ok(())
+            }
+        }
+    }
+
+    /// Creates a weak clone of an actor
+    /// Weak clones cannot sent message
+    /// They can only wait for the actor to die
+    pub fn weak(&self) -> Actor<M> {
+        Self {
+            channel: None,
+            should_die: self.should_die.clone(),
+            till_death: self.till_death.clone(),
+            is_dead: self.is_dead.clone(),
         }
     }
 }
