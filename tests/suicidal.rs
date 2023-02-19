@@ -1,10 +1,9 @@
 use std::thread;
 use std::time::Duration;
 
-mod lib;
-use lib::Actor;
-use lib::SuicidalActor;
-use lib::SuicidalInterpreter;
+use theatre::Actor;
+use theatre::SuicidalActor;
+use theatre::SuicidalInterpreter;
 
 pub struct CoutingIntepreter(u32);
 
@@ -19,12 +18,16 @@ impl SuicidalInterpreter<u32> for CoutingIntepreter {
     }
 }
 
-fn main() {
+#[test]
+#[should_panic]
+fn disgracefully_close() {
     let counter = CoutingIntepreter(0);
     let actor = SuicidalActor::new(counter);
+    actor.tell(3).unwrap();
+    actor.tell(5).unwrap();
+    // Actor will kill himself after receiving an even number
     actor.tell(2).unwrap();
-    actor.tell(13).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    // Actor should be dead so this should fail
     actor.tell(7).unwrap();
-    actor.tell(57).unwrap();
-    thread::sleep(Duration::from_millis(3000));
 }
