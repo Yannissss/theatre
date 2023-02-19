@@ -2,8 +2,8 @@ use std::{
     fmt::Display,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvError},
-        Arc,
+        mpsc::{self, Receiver, RecvError, Sender},
+        Arc, Condvar, Mutex,
     },
     thread,
 };
@@ -50,16 +50,77 @@ where
 /// Internally it actually forks an OS thread
 /// that listens to incoming message and process
 /// them
-#[derive(Clone)]
 pub struct Actor<M> {
-    channel: mpsc::Sender<Option<M>>,
+    channel: Sender<Option<M>>,
     should_die: Arc<AtomicBool>,
+    till_death: Arc<Condvar>,
+    is_dead: Arc<Mutex<bool>>,
+}
+
+impl<M> Clone for Actor<M> {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            should_die: self.should_die.clone(),
+            till_death: self.till_death.clone(),
+            is_dead: self.is_dead.clone(),
+        }
+    }
 }
 
 impl<M> Actor<M>
 where
     M: 'static + Send,
 {
+    /// Consumes all notification until it is notifier to die
+    fn loop_until_killed<I>(&self, interpreter: &mut I, consumer: &Receiver<Option<M>>)
+    where
+        I: Interpreter<M>,
+    {
+        loop {
+            // Check if it has to die
+            if self.should_die.load(Ordering::SeqCst) {
+                break;
+            }
+            // Wait for an incoming message
+            match consumer.recv() {
+                // All channels were closed
+                Err(RecvError) => break,
+                // Someone request that actor dies
+                Ok(None) => break,
+                // Process the message
+                Ok(Some(message)) => {
+                    // Otherwise process the message
+                    interpreter.interpret(message);
+                }
+            }
+        }
+    }
+
+    /// Cleanup all pending messages
+    fn cleanup<I>(&self, interpreter: &mut I, consumer: &Receiver<Option<M>>)
+    where
+        I: Interpreter<M>,
+    {
+        while let Ok(message) = consumer.try_recv() {
+            match message {
+                None => (), // Do nothing since message was a kill signal
+                Some(message) => interpreter.interpret(message),
+            }
+        }
+    }
+
+    /// Dies & notify all waiters
+    fn die(self) {
+        let till_death = self.till_death.clone();
+        let is_dead = self.is_dead.clone();
+        drop(self);
+
+        let mut guard = is_dead.lock().unwrap();
+        *guard = true;
+        till_death.notify_all();
+    }
+
     /// Creates and returns and actor that gracefully
     /// process all pending messages when asked to die
     pub fn graceful<I>(interpreter: I) -> Self
@@ -67,26 +128,25 @@ where
         I: Interpreter<M> + Send + 'static,
     {
         let (channel, consumer) = mpsc::channel();
-        let should_die = Arc::new(AtomicBool::new(false));
+        let actor = Self {
+            channel,
+            should_die: Arc::new(AtomicBool::new(false)),
+            till_death: Arc::new(Condvar::default()),
+            is_dead: Arc::new(Mutex::new(false)),
+        };
+        let cloned_actor = actor.clone();
 
         let mut interpreter = interpreter;
-        let thread_should_die = should_die.clone();
         thread::spawn(move || {
             // Main message handling loop
-            consume_until_killed(&mut interpreter, &consumer, &thread_should_die);
+            actor.loop_until_killed(&mut interpreter, &consumer);
             // Cleaning up
-            while let Ok(message) = consumer.recv() {
-                match message {
-                    None => (), // Do nothing since message was a kill signal
-                    Some(message) => interpreter.interpret(message),
-                }
-            }
+            actor.cleanup(&mut interpreter, &consumer);
+            // Dies & notify all waiters
+            actor.die();
         });
 
-        Self {
-            channel,
-            should_die,
-        }
+        cloned_actor
     }
 
     /// Creates and returns and actor that disgracefully
@@ -96,21 +156,25 @@ where
         I: Interpreter<M> + Send + 'static,
     {
         let (channel, consumer) = mpsc::channel();
-        let should_die = Arc::new(AtomicBool::new(false));
+        let actor = Self {
+            channel,
+            should_die: Arc::new(AtomicBool::new(false)),
+            till_death: Arc::new(Condvar::default()),
+            is_dead: Arc::new(Mutex::new(false)),
+        };
+        let cloned_actor = actor.clone();
 
         let mut interpreter = interpreter;
-        let thread_should_die = should_die.clone();
         thread::spawn(move || {
             // Main message handling loop
-            consume_until_killed(&mut interpreter, &consumer, &thread_should_die);
+            actor.loop_until_killed(&mut interpreter, &consumer);
             // Cleaning up
-            // Nothing to do here since we are disgraceful!
+            // No cleaning up since we are disgraceful
+            // Dies & notify all waiters
+            actor.die();
         });
 
-        Self {
-            channel,
-            should_die,
-        }
+        cloned_actor
     }
 
     /// Creates and returns and actor that gracefully
@@ -120,10 +184,19 @@ where
     }
 
     /// Waits indefinitely until the actor is declared dead
-    /// Possible deadlock
-    /// TODO: Fix deadlocks
+    /// Renounce on its ability to send messages
+    /// Will deadlock if actor is alread dead
     pub fn wait(self) {
-        unimplemented!();
+        let till_death = self.till_death.clone();
+        let is_dead = self.is_dead.clone();
+        drop(self);
+
+        // Check is actor is not already dead
+        // and wait for the notification
+        let mut guard = is_dead.lock().unwrap();
+        while !*guard {
+            guard = till_death.wait(guard).unwrap();
+        }
     }
 
     /// Send a message to an actor
@@ -138,41 +211,11 @@ where
     /// And error explaining the reason it could not do if not
     /// Trying to kill a dead actor does not do anything
     pub fn kill(&self) {
-        self.should_die.store(true, Ordering::Relaxed);
+        self.should_die.store(true, Ordering::SeqCst);
         // Signal the actor that he has to die
         match self.channel.send(None) {
             Err(_) => (), // Actor already dead so do nothing
             Ok(_) => (),  // Sent a dummy message to process
-        }
-    }
-}
-
-/// Standalone routine of consumer threads
-/// Outside of impl to reduce compile time
-fn consume_until_killed<M, I>(
-    interpreter: &mut I,
-    consumer: &mpsc::Receiver<Option<M>>,
-    thread_should_die: &AtomicBool,
-) where
-    M: 'static + Send,
-    I: Interpreter<M>,
-{
-    loop {
-        // Check if it has to die
-        if thread_should_die.load(Ordering::SeqCst) {
-            break;
-        }
-        // Wait for an incoming message
-        match consumer.recv() {
-            // All channels were closed
-            Err(RecvError) => break,
-            // Someone request that actor dies
-            Ok(None) => break,
-            // Process the message
-            Ok(Some(message)) => {
-                // Otherwise process the message
-                interpreter.interpret(message);
-            }
         }
     }
 }

@@ -1,10 +1,10 @@
-use std::thread;
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use theatre::{Actor, Echo};
 
-fn sleep_millis(count: u64) {
-    thread::sleep(Duration::from_millis(count))
+#[inline]
+fn sleep_ms(count: u64) {
+    thread::sleep(Duration::from_millis(count));
 }
 
 #[test]
@@ -30,7 +30,7 @@ fn test_graceful() {
 fn test_disgraceful() {
     let actor: Actor<i32> = Actor::disgraceful(Echo);
     actor.tell(0).unwrap();
-    sleep_millis(100);
+    sleep_ms(200);
     actor.kill();
     for k in 1..=10 {
         actor.tell(k).unwrap();
@@ -47,5 +47,23 @@ fn test_blanket_interpreters() {
         actor.tell(k).unwrap();
     }
     actor.kill();
+    actor.wait();
+}
+
+#[test]
+fn test_death_wait() {
+    let actor: Actor<i32> = Actor::graceful(Echo);
+
+    let cloned_actor = actor.clone();
+    thread::spawn(move || {
+        sleep_ms(200);
+        for k in 1..=5 {
+            cloned_actor.tell(4 * k - 3).unwrap();
+            sleep_ms(150);
+        }
+        cloned_actor.kill();
+    });
+
+    println!("Waiting for actor to die...");
     actor.wait();
 }
