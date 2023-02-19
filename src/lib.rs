@@ -1,198 +1,180 @@
-use std::sync;
-use std::sync::mpsc;
-use std::thread;
+use std::{
+    fmt::Display,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvError},
+        Arc,
+    },
+    thread,
+};
+use thiserror::Error;
 
-#[derive(Clone, Debug)]
-pub enum ActorError<T> {
-    Immortal,
-    Unsendable(T),
+/// Possible errors when dealing with actors
+#[derive(Error, Debug)]
+pub enum ActingErr {
+    #[error("Actor that was contacted is dead!")]
+    DeadActor,
 }
 
-pub trait Actor<T> {
-    fn tell(&self, message: T) -> Result<(), ActorError<T>>;
-
-    fn kill(self) -> Result<(), ActorError<T>>;
+/// Trait that describe that a stateful interpreter
+/// of messages
+pub trait Interpreter<M> {
+    fn interpret(&mut self, message: M);
 }
 
-pub trait Interpreter<T> {
-    fn process(&mut self, message: T);
-}
+/// Dummy interpreter that simply echoes the messages it receives
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Echo;
 
-pub trait SuicidalInterpreter<T> {
-    fn process(&mut self, message: T) -> bool;
-}
-
-#[derive(Clone)]
-pub struct BaseActor<T> {
-    sender: mpsc::Sender<Option<T>>,
-    should_die: sync::Arc<sync::Mutex<bool>>,
-}
-
-impl<T> Actor<T> for BaseActor<T> {
-    fn tell(&self, message: T) -> Result<(), ActorError<T>> {
-        match self.sender.send(Some(message)) {
-            Err(mpsc::SendError(Some(message))) => Err(ActorError::Unsendable(message)),
-            _ => Ok(()),
-        }
+impl<M> Interpreter<M> for Echo
+where
+    M: Display,
+{
+    fn interpret(&mut self, message: M) {
+        println!("Echo: {}", message);
     }
+}
 
-    fn kill(self) -> Result<(), ActorError<T>> {
-        match self.should_die.lock() {
-            Err(_) => Err(ActorError::Immortal),
-            Ok(mut should_die) => {
-                *should_die = true;
-                match self.sender.send(None) {
-                    Ok(()) => Ok(()),
-                    _ => Err(ActorError::Immortal),
+/// Blank implementation for all functions
+/// Similear to Fn(M) -> ()
+impl<M, F> Interpreter<M> for F
+where
+    F: Fn(M),
+{
+    fn interpret(&mut self, message: M) {
+        self(message)
+    }
+}
+
+/// An actor which process messages of type M
+/// Internally it actually forks an OS thread
+/// that listens to incoming message and process
+/// them
+#[derive(Clone)]
+pub struct Actor<M> {
+    channel: mpsc::Sender<Option<M>>,
+    should_die: Arc<AtomicBool>,
+}
+
+impl<M> Actor<M>
+where
+    M: 'static + Send,
+{
+    /// Creates and returns and actor that gracefully
+    /// process all pending messages when asked to die
+    pub fn graceful<I>(interpreter: I) -> Self
+    where
+        I: Interpreter<M> + Send + 'static,
+    {
+        let (channel, consumer) = mpsc::channel();
+        let should_die = Arc::new(AtomicBool::new(false));
+
+        let mut interpreter = interpreter;
+        let thread_should_die = should_die.clone();
+        thread::spawn(move || {
+            // Main message handling loop
+            loop {
+                // Check if it has to die
+                if thread_should_die.load(Ordering::SeqCst) {
+                    break;
                 }
-            }
-        }
-    }
-}
-
-/// Actor that gracefully interpretes all pending messages before letting itself be killed
-#[derive(Clone)]
-pub struct GracefulActor<T>(BaseActor<T>);
-
-impl<T> Actor<T> for GracefulActor<T> {
-    fn tell(&self, message: T) -> Result<(), ActorError<T>> {
-        self.0.tell(message)
-    }
-
-    fn kill(self) -> Result<(), ActorError<T>> {
-        self.0.kill()
-    }
-}
-
-#[allow(dead_code)]
-impl<T> GracefulActor<T>
-where
-    T: Send + 'static,
-{
-    pub fn new<I>(mut interpreter: I) -> GracefulActor<T>
-    where
-        I: Interpreter<T>,
-        I: Send + 'static,
-    {
-        let (sender, receiver) = mpsc::channel();
-        let should_die = sync::Arc::new(sync::Mutex::new(false));
-
-        let local_should_die = should_die.clone();
-        thread::spawn(move || loop {
-            let next = receiver.recv().unwrap();
-            let should_die = local_should_die.lock().unwrap();
-            match next {
-                None => break,
-                Some(message) => interpreter.process(message),
-            }
-            if *should_die {
-                // Die gracefull
-                loop {
-                    match receiver.try_recv() {
-                        Ok(Some(message)) => interpreter.process(message),
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        _ => (),
-                    }
-                }
-                break;
-            }
-        });
-
-        Self(BaseActor { sender, should_die })
-    }
-}
-
-/// Actor that disgracefully ignores all pending messages before letting itself be killed
-#[derive(Clone)]
-pub struct DisgracefulActor<T>(BaseActor<T>);
-
-impl<T> Actor<T> for DisgracefulActor<T> {
-    fn tell(&self, message: T) -> Result<(), ActorError<T>> {
-        self.0.tell(message)
-    }
-
-    fn kill(self) -> Result<(), ActorError<T>> {
-        self.0.kill()
-    }
-}
-
-#[allow(dead_code)]
-impl<T> DisgracefulActor<T>
-where
-    T: Send + 'static,
-{
-    pub fn new<I>(mut interpreter: I) -> DisgracefulActor<T>
-    where
-        I: Interpreter<T>,
-        I: Send + 'static,
-    {
-        let (sender, receiver) = mpsc::channel();
-        let should_die = sync::Arc::new(sync::Mutex::new(false));
-
-        let local_should_die = should_die.clone();
-        thread::spawn(move || loop {
-            let next = receiver.recv().unwrap();
-            let should_die = local_should_die.lock().unwrap();
-            match next {
-                None => break,
-                Some(message) => interpreter.process(message),
-            }
-            if *should_die {
-                // Die disgracefull
-                break;
-            }
-        });
-
-        Self(BaseActor { sender, should_die })
-    }
-}
-
-/// Actor that disgracefully ignores all pending messages before letting itself be
-/// killed or killing itself
-#[derive(Clone)]
-pub struct SuicidalActor<T>(BaseActor<T>);
-
-impl<T> Actor<T> for SuicidalActor<T> {
-    fn tell(&self, message: T) -> Result<(), ActorError<T>> {
-        self.0.tell(message)
-    }
-
-    fn kill(self) -> Result<(), ActorError<T>> {
-        self.0.kill()
-    }
-}
-
-#[allow(dead_code)]
-impl<T> SuicidalActor<T>
-where
-    T: Send + 'static,
-{
-    pub fn new<I>(mut interpreter: I) -> SuicidalActor<T>
-    where
-        I: SuicidalInterpreter<T>,
-        I: Send + 'static,
-    {
-        let (sender, receiver) = mpsc::channel();
-        let should_die = sync::Arc::new(sync::Mutex::new(false));
-
-        let local_should_die = should_die.clone();
-        thread::spawn(move || loop {
-            let next = receiver.recv().unwrap();
-            let should_die = local_should_die.lock().unwrap();
-            match next {
-                None => break,
-                Some(message) => {
-                    if interpreter.process(message) {
-                        break;
+                // Wait for an incoming message
+                match consumer.recv() {
+                    // All channels were closed
+                    Err(RecvError) => break,
+                    // Someone request that actor dies
+                    Ok(None) => break,
+                    // Process the message
+                    Ok(Some(message)) => {
+                        // Otherwise process the message
+                        interpreter.interpret(message);
                     }
                 }
             }
-            if *should_die {
-                // Die disgracefull
-                break;
+            // Cleaning up
+            while let Ok(message) = consumer.recv() {
+                match message {
+                    None => (), // Do nothing since message was a kill signal
+                    Some(message) => interpreter.interpret(message),
+                }
             }
         });
 
-        Self(BaseActor { sender, should_die })
+        Self {
+            channel,
+            should_die,
+        }
+    }
+
+    /// Creates and returns and actor that disgracefully
+    /// ignore all pending messages when asked to die
+    pub fn disgraceful<I>(interpreter: I) -> Self
+    where
+        I: Interpreter<M> + Send + 'static,
+    {
+        let (channel, consumer) = mpsc::channel();
+        let should_die = Arc::new(AtomicBool::new(false));
+
+        let mut interpreter = interpreter;
+        let thread_should_die = should_die.clone();
+        thread::spawn(move || {
+            // Main message handling loop
+            loop {
+                // Check if it has to die
+                if thread_should_die.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Wait for an incoming message
+                match consumer.recv() {
+                    // All channels were closed
+                    Err(RecvError) => break,
+                    // Someone request that actor dies
+                    Ok(None) => break,
+                    // Process the message
+                    Ok(Some(message)) => {
+                        // Otherwise process the message
+                        interpreter.interpret(message);
+                    }
+                }
+            }
+            // Cleaning up
+            while let Ok(message) = consumer.recv() {
+                match message {
+                    None => (), // Do nothing since message was a kill signal
+                    Some(message) => interpreter.interpret(message),
+                }
+            }
+        });
+
+        Self {
+            channel,
+            should_die,
+        }
+    }
+
+    /// Creates and returns and actor that gracefully
+    /// process all pending messages when asked to die
+    pub fn suicidal() -> Self {
+        unimplemented!()
+    }
+
+    /// Send a message to an actor
+    pub fn tell(&self, message: M) -> Result<(), ActingErr> {
+        self.channel
+            .send(Some(message))
+            .map_err(|_| ActingErr::DeadActor)
+    }
+
+    /// Kills an actor
+    /// This function returns `Ok(())` if it succesfully kills it
+    /// And error explaining the reason it could not do if not
+    /// Trying to kill a dead actor does not do anything
+    pub fn kill(&self) {
+        self.should_die.store(true, Ordering::Relaxed);
+        // Signal the actor that he has to die
+        match self.channel.send(None) {
+            Err(_) => (), // Actor already dead so do nothing
+            Ok(_) => (),  // Sent a dummy message to process
+        }
     }
 }
