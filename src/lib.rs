@@ -73,24 +73,7 @@ where
         let thread_should_die = should_die.clone();
         thread::spawn(move || {
             // Main message handling loop
-            loop {
-                // Check if it has to die
-                if thread_should_die.load(Ordering::SeqCst) {
-                    break;
-                }
-                // Wait for an incoming message
-                match consumer.recv() {
-                    // All channels were closed
-                    Err(RecvError) => break,
-                    // Someone request that actor dies
-                    Ok(None) => break,
-                    // Process the message
-                    Ok(Some(message)) => {
-                        // Otherwise process the message
-                        interpreter.interpret(message);
-                    }
-                }
-            }
+            consume_until_killed(&mut interpreter, &consumer, &thread_should_die);
             // Cleaning up
             while let Ok(message) = consumer.recv() {
                 match message {
@@ -119,31 +102,9 @@ where
         let thread_should_die = should_die.clone();
         thread::spawn(move || {
             // Main message handling loop
-            loop {
-                // Check if it has to die
-                if thread_should_die.load(Ordering::SeqCst) {
-                    break;
-                }
-                // Wait for an incoming message
-                match consumer.recv() {
-                    // All channels were closed
-                    Err(RecvError) => break,
-                    // Someone request that actor dies
-                    Ok(None) => break,
-                    // Process the message
-                    Ok(Some(message)) => {
-                        // Otherwise process the message
-                        interpreter.interpret(message);
-                    }
-                }
-            }
+            consume_until_killed(&mut interpreter, &consumer, &thread_should_die);
             // Cleaning up
-            while let Ok(message) = consumer.recv() {
-                match message {
-                    None => (), // Do nothing since message was a kill signal
-                    Some(message) => interpreter.interpret(message),
-                }
-            }
+            // Nothing to do here since we are disgraceful!
         });
 
         Self {
@@ -156,6 +117,13 @@ where
     /// process all pending messages when asked to die
     pub fn suicidal() -> Self {
         unimplemented!()
+    }
+
+    /// Waits indefinitely until the actor is declared dead
+    /// Possible deadlock
+    /// TODO: Fix deadlocks
+    pub fn wait(self) {
+        unimplemented!();
     }
 
     /// Send a message to an actor
@@ -175,6 +143,36 @@ where
         match self.channel.send(None) {
             Err(_) => (), // Actor already dead so do nothing
             Ok(_) => (),  // Sent a dummy message to process
+        }
+    }
+}
+
+/// Standalone routine of consumer threads
+/// Outside of impl to reduce compile time
+fn consume_until_killed<M, I>(
+    interpreter: &mut I,
+    consumer: &mpsc::Receiver<Option<M>>,
+    thread_should_die: &AtomicBool,
+) where
+    M: 'static + Send,
+    I: Interpreter<M>,
+{
+    loop {
+        // Check if it has to die
+        if thread_should_die.load(Ordering::SeqCst) {
+            break;
+        }
+        // Wait for an incoming message
+        match consumer.recv() {
+            // All channels were closed
+            Err(RecvError) => break,
+            // Someone request that actor dies
+            Ok(None) => break,
+            // Process the message
+            Ok(Some(message)) => {
+                // Otherwise process the message
+                interpreter.interpret(message);
+            }
         }
     }
 }
